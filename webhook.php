@@ -1,0 +1,267 @@
+<?php
+
+require_once __DIR__ . '/src/telegram.php';
+require_once __DIR__ . '/src/OrderManager.php';
+$config = include __DIR__ . '/config.php';
+
+// Подключение к БД
+try {
+    $dsn = "mysql:host={$config['db']['host']};dbname={$config['db']['name']};charset={$config['db']['charset']}";
+    $pdo = new PDO($dsn, $config['db']['user'], $config['db']['pass'], [
+        PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION,
+        PDO::ATTR_DEFAULT_FETCH_MODE => PDO::FETCH_ASSOC,
+    ]);
+} catch (PDOException $e) {
+    error_log("DB Connection Error: " . $e->getMessage());
+    exit;
+}
+
+$orderManager = new OrderManager($pdo, $config);
+
+// Получение данных от Telegram
+$content = file_get_contents("php://input");
+$update = json_decode($content, true);
+
+if (!$update) {
+    exit;
+}
+
+$message = $update['message'] ?? null;
+$callbackQuery = $update['callback_query'] ?? null;
+
+$chatId = null;
+$userId = null;
+$text = null;
+$data = null;
+
+if ($message) {
+    $chatId = $message['chat']['id'];
+    $userId = $message['from']['id'];
+    $username = $message['from']['username'] ?? '';
+    $firstName = $message['from']['first_name'] ?? '';
+    $text = $message['text'] ?? '';
+} elseif ($callbackQuery) {
+    $chatId = $callbackQuery['message']['chat']['id'];
+    $userId = $callbackQuery['from']['id'];
+    $username = $callbackQuery['from']['username'] ?? '';
+    $firstName = $callbackQuery['from']['first_name'] ?? '';
+    $data = $callbackQuery['data'];
+}
+
+if (!$chatId) exit;
+
+// Регистрация или получение пользователя
+$stmt = $pdo->prepare("SELECT * FROM users WHERE telegram_id = ?");
+$stmt->execute([$userId]);
+$user = $stmt->fetch();
+
+if (!$user) {
+    $stmt = $pdo->prepare("INSERT INTO users (telegram_id, username, first_name) VALUES (?, ?, ?)");
+    $stmt->execute([$userId, $username, $firstName ?? '']);
+    $stmt = $pdo->prepare("SELECT * FROM users WHERE telegram_id = ?");
+    $stmt->execute([$userId]);
+    $user = $stmt->fetch();
+} else {
+    // Обновим инфо если поменялось
+    $stmt = $pdo->prepare("UPDATE users SET username = ?, first_name = ? WHERE id = ?");
+    $stmt->execute([$username, $firstName, $user['id']]);
+}
+
+$mainMenu = [
+    'inline_keyboard' => [
+        [['text' => '📦 Мои заявки', 'callback_data' => 'my_orders']],
+        [['text' => '🔄 Хочу обменять', 'callback_data' => 'create_order']],
+        [['text' => '📜 История', 'callback_data' => 'history']]
+    ]
+];
+
+// Сброс по команде /start
+if ($text === '/start') {
+    $pdo->prepare("UPDATE users SET state = 'IDLE', step_data = NULL WHERE id = ?")->execute([$user['id']]);
+    sendMessage($chatId, "Привет, <b>" . ($user['first_name'] ?: 'Друг') . "</b>! Это P2P бот для обмена валют. Что выберете?", $mainMenu);
+    exit;
+}
+
+$state = $user['state'];
+$stepData = $user['step_data'] ? json_decode($user['step_data'], true) : [];
+
+// --- ОБРАБОТКА CALLBACK ---
+if ($callbackQuery) {
+    answerCallbackQuery($callbackQuery['id']);
+    
+    // Переход в создание заявки
+    if ($data === 'create_order') {
+        $pdo->prepare("UPDATE users SET state = 'WAIT_SELL_CURRENCY', step_data = NULL WHERE id = ?")->execute([$user['id']]);
+        $buttons = [];
+        foreach (array_chunk($config['currencies'], 3) as $chunk) {
+            $row = [];
+            foreach ($chunk as $curr) { $row[] = ['text' => $curr, 'callback_data' => "sell_$curr"]; }
+            $buttons[] = $row;
+        }
+        sendMessage($chatId, "Какую валюту вы хотите <b>ОТДАТЬ</b>?", ['inline_keyboard' => $buttons]);
+        exit;
+    }
+
+    // Выбор валюты ОТДАТЬ
+    if (strpos($data, 'sell_') === 0 && $state === 'WAIT_SELL_CURRENCY') {
+        $currency = str_replace('sell_', '', $data);
+        $stepData['sell_currency'] = $currency;
+        $pdo->prepare("UPDATE users SET state = 'WAIT_AMOUNT', step_data = ? WHERE id = ?")->execute([json_encode($stepData), $user['id']]);
+        sendMessage($chatId, "Введите объем <b>$currency</b> который у вас есть (числом):");
+        exit;
+    }
+
+    // Выбор валюты ПОЛУЧИТЬ (множественный выбор)
+    if (strpos($data, 'buy_') === 0 && $state === 'WAIT_BUY_CURRENCY') {
+        $currency = str_replace('buy_', '', $data);
+        if (!isset($stepData['buy_currencies'])) $stepData['buy_currencies'] = [];
+        
+        if (in_array($currency, $stepData['buy_currencies'])) {
+            $stepData['buy_currencies'] = array_values(array_diff($stepData['buy_currencies'], [$currency]));
+        } else {
+            $stepData['buy_currencies'][] = $currency;
+        }
+        
+        $pdo->prepare("UPDATE users SET step_data = ? WHERE id = ?")->execute([json_encode($stepData), $user['id']]);
+        
+        $buttons = [];
+        foreach (array_chunk($config['currencies'], 2) as $chunk) {
+            $row = [];
+            foreach ($chunk as $curr) {
+                $check = in_array($curr, $stepData['buy_currencies']) ? " ✅" : "";
+                $row[] = ['text' => $curr . $check, 'callback_data' => "buy_$curr"];
+            }
+            $buttons[] = $row;
+        }
+        $buttons[] = [['text' => '✅ ГОТОВО (минимум одна)', 'callback_data' => 'buy_done']];
+        
+        editMessageText($chatId, $callbackQuery['message']['message_id'], "Выберите валюты которые хотите <b>ПОЛУЧИТЬ</b>:", ['inline_keyboard' => $buttons]);
+        exit;
+    }
+
+    // Завершение создания
+    if ($data === 'buy_done' && $state === 'WAIT_BUY_CURRENCY') {
+        if (empty($stepData['buy_currencies'])) {
+            sendMessage($chatId, "Ошибка: выберите хотя бы одну валюту!");
+            exit;
+        }
+        
+        // Создаем заявку
+        $orderManager->createOrder($user['id'], $stepData['sell_currency'], $stepData['amount'], $stepData['buy_currencies']);
+        $pdo->prepare("UPDATE users SET state = 'IDLE', step_data = NULL WHERE id = ?")->execute([$user['id']]);
+        
+        sendMessage($chatId, "✅ <b>Заявка создана!</b>\n\nИщем подходящие предложения...");
+        
+        // Мачинг
+        $matches = $orderManager->findMatches($user['id'], $stepData['sell_currency'], json_encode($stepData['buy_currencies']));
+        
+        if (empty($matches)) {
+            sendMessage($chatId, "Пока подходящих заявок нет. Вам придет уведомление, когда кто-то откликнется.", $mainMenu);
+        } else {
+            $matchButtons = [];
+            foreach ($matches as $m) {
+                $matchButtons[] = [['text' => "👤 {$m['first_name']} ({$m['sell_currency']} -> {$m['amount']})", 'callback_data' => "respond_{$m['id']}"]];
+            }
+            sendMessage($chatId, "Найдены подходящие заявки (до 10):", ['inline_keyboard' => $matchButtons]);
+        }
+        exit;
+    }
+
+    // Отклик на чужую заявку
+    if (strpos($data, 'respond_') === 0) {
+        $orderId = (int)str_replace('respond_', '', $data);
+        // Создаем запись в matches
+        $stmt = $pdo->prepare("INSERT INTO matches (order_id, responder_id) VALUES (?, ?)");
+        $stmt->execute([$orderId, $user['id']]);
+        $matchId = $pdo->lastInsertId();
+
+        // Уведомление создателю
+        $stmt = $pdo->prepare("SELECT o.*, u.telegram_id FROM orders o JOIN users u ON o.user_id = u.id WHERE o.id = ?");
+        $stmt->execute([$orderId]);
+        $orderInfo = $stmt->fetch();
+
+        sendMessage($orderInfo['telegram_id'], "🔔 На вашу заявку <b>#$orderId</b> откликнулся пользователь <b>{$user['first_name']}</b>!", [
+            'inline_keyboard' => [
+                [['text' => '✅ ПРИНЯТЬ СДЕЛКУ', 'callback_data' => "accept_$matchId"]]
+            ]
+        ]);
+        
+        sendMessage($chatId, "Ваш запрос отправлен. Ожидайте подтверждения.");
+        exit;
+    }
+
+    // Подтверждение сделки
+    if (strpos($data, 'accept_') === 0) {
+        $matchId = (int)str_replace('accept_', '', $data);
+        // Получаем инфу
+        $stmt = $pdo->prepare("SELECT m.*, o.sell_currency, o.amount, o.user_id as owner_id, u.telegram_id as responder_tid, u.username as responder_un, u.first_name as responder_name FROM matches m JOIN orders o ON m.order_id = o.id JOIN users u ON m.responder_id = u.id WHERE m.id = ?");
+        $stmt->execute([$matchId]);
+        $mInfo = $stmt->fetch();
+
+        $pdo->prepare("UPDATE matches SET status = 'accepted' WHERE id = ?")->execute([$matchId]);
+        $pdo->prepare("UPDATE orders SET status = 'closed', is_active = FALSE WHERE id = ?")->execute([$mInfo['order_id']]);
+
+        $owner = $pdo->query("SELECT * FROM users WHERE id = {$mInfo['owner_id']}")->fetch();
+
+        // Обмен контактами
+        $ownerContact = $owner['username'] ? "@" . $owner['username'] : "ID: " . $owner['telegram_id'];
+        $respContact = $mInfo['responder_un'] ? "@" . $mInfo['responder_un'] : "ID: " . $mInfo['responder_tid'];
+
+        sendMessage($mInfo['responder_tid'], "🎉 Сделка принята!\nКонтакт продавца: <b>$ownerContact</b> ({$owner['first_name']})");
+        sendMessage($chatId, "🎉 Контакты покупателя: <b>$respContact</b> ({$mInfo['responder_name']})");
+
+        // После сделки - управление остатком
+        sendMessage($chatId, "Сделка завершена. Что сделать с остатком в заявке #{$mInfo['order_id']}?", [
+            'inline_keyboard' => [
+                [['text' => '✏️ Изменить объем', 'callback_data' => "edit_amt_{$mInfo['order_id']}"]],
+                [['text' => '❌ Закрыть заявку', 'callback_data' => "close_{$mInfo['order_id']}"]],
+                [['text' => '⚠️ Оставить как есть (неудачно)', 'callback_data' => 'main_menu']]
+            ]
+        ]);
+        exit;
+    }
+
+    // Управление моими заявками
+    if ($data === 'my_orders') {
+        $orders = $orderManager->getUserOrders($user['id']);
+        if (empty($orders)) {
+            sendMessage($chatId, "У вас нет активных заявок.", $mainMenu);
+        } else {
+            $txt = "Ваши активные заявки:\n";
+            $btns = [];
+            foreach ($orders as $o) {
+                $txt .= "• #{$o['id']} {$o['sell_currency']} -> {$o['amount']}\n";
+                $btns[] = [['text' => "Закрыть #{$o['id']}", 'callback_data' => "close_{$o['id']}"]];
+            }
+            $btns[] = [['text' => '◀️ Назад', 'callback_data' => 'main_menu']];
+            sendMessage($chatId, $txt, ['inline_keyboard' => $btns]);
+        }
+        exit;
+    }
+
+    if ($data === 'main_menu') {
+        sendMessage($chatId, "Главное меню:", $mainMenu);
+        exit;
+    }
+}
+
+// --- ОБРАБОТКА ТЕКСТА (FSM) ---
+if ($text && $state === 'WAIT_AMOUNT') {
+    $amount = str_replace(',', '.', $text);
+    if (!is_numeric($amount) || $amount <= 0) {
+        sendMessage($chatId, "Пожалуйста, введите корректное число больше нуля:");
+        exit;
+    }
+    
+    $stepData['amount'] = (float)$amount;
+    $pdo->prepare("UPDATE users SET state = 'WAIT_BUY_CURRENCY', step_data = ? WHERE id = ?")->execute([json_encode($stepData), $user['id']]);
+    
+    $buttons = [];
+    foreach (array_chunk($config['currencies'], 2) as $chunk) {
+        $row = [];
+        foreach ($chunk as $curr) { $row[] = ['text' => $curr, 'callback_data' => "buy_$curr"]; }
+        $buttons[] = $row;
+    }
+    sendMessage($chatId, "Теперь выберите валюты которые хотите <b>ПОЛУЧИТЬ</b> (одну или несколько):", ['inline_keyboard' => $buttons]);
+    exit;
+}
