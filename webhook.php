@@ -71,6 +71,7 @@ $mainMenu = [
     'inline_keyboard' => [
         [['text' => '📦 Мои заявки', 'callback_data' => 'my_orders']],
         [['text' => '🔄 Хочу обменять', 'callback_data' => 'create_order']],
+        [['text' => '🔍 Открытые заявки', 'callback_data' => 'view_open_orders']],
         [['text' => '📜 История', 'callback_data' => 'history']]
     ]
 ];
@@ -89,6 +90,42 @@ $stepData = $user['step_data'] ? json_decode($user['step_data'], true) : [];
 if ($callbackQuery) {
     answerCallbackQuery($callbackQuery['id']);
     
+    // Переход к просмотру всех заявок
+    if ($data === 'view_open_orders') {
+        $pdo->prepare("UPDATE users SET state = 'WAIT_VIEW_CURRENCY' WHERE id = ?")->execute([$user['id']]);
+        $buttons = [];
+        foreach (array_chunk($config['currencies'], 2) as $chunk) {
+            $row = [];
+            foreach ($chunk as $curr) { $row[] = ['text' => "Смотреть $curr", 'callback_data' => "viewcurr_$curr"]; }
+            $buttons[] = $row;
+        }
+        $buttons[] = [['text' => '◀️ Назад', 'callback_data' => 'main_menu']];
+        sendMessage($chatId, "Выберите валюту, которую продают другие пользователи:", ['inline_keyboard' => $buttons]);
+        exit;
+    }
+
+    // Показ заявок по выбранной валюте
+    if (strpos($data, 'viewcurr_') === 0 && $state === 'WAIT_VIEW_CURRENCY') {
+        $currency = str_replace('viewcurr_', '', $data);
+        $orders = $orderManager->findByCurrency($user['id'], $currency);
+        
+        $pdo->prepare("UPDATE users SET state = 'IDLE' WHERE id = ?")->execute([$user['id']]);
+
+        if (empty($orders)) {
+            sendMessage($chatId, "Активных заявок по валюте <b>$currency</b> пока нет.", $mainMenu);
+        } else {
+            $btns = [];
+            foreach ($orders as $o) {
+                $buyArr = json_decode($o['buy_currencies'], true);
+                $buyStr = implode(', ', $buyArr);
+                $btns[] = [['text' => "👤 {$o['first_name']} ({$o['amount']} $currency -> $buyStr)", 'callback_data' => "respond_{$o['id']}"]];
+            }
+            $btns[] = [['text' => '◀️ В главное меню', 'callback_data' => 'main_menu']];
+            sendMessage($chatId, "Найдено " . count($orders) . " заявок по <b>$currency</b>:", ['inline_keyboard' => $btns]);
+        }
+        exit;
+    }
+
     // Переход в создание заявки
     if ($data === 'create_order') {
         $pdo->prepare("UPDATE users SET state = 'WAIT_SELL_CURRENCY', step_data = NULL WHERE id = ?")->execute([$user['id']]);
@@ -154,7 +191,7 @@ if ($callbackQuery) {
         editMessageText($chatId, $callbackQuery['message']['message_id'], "✅ <b>Заявка создана!</b>\n\nИщем подходящие предложения...");
         
         // Мачинг
-        $matches = $orderManager->findMatches($user['id'], $stepData['sell_currency'], $stepData['buy_currencies']);
+        $matches = $orderManager->findMatches($user['id'], $stepData['sell_currency'], $stepData['amount'], $stepData['buy_currencies']);
         
         if (empty($matches)) {
             sendMessage($chatId, "Пока подходящих заявок нет. Вам придет уведомление, когда кто-то откликнется на вашу заявку.", $mainMenu);
@@ -209,15 +246,16 @@ if ($callbackQuery) {
         $ownerContact = $owner['username'] ? "@" . $owner['username'] : "ID: " . $owner['telegram_id'];
         $respContact = $mInfo['responder_un'] ? "@" . $mInfo['responder_un'] : "ID: " . $mInfo['responder_tid'];
 
-        sendMessage($mInfo['responder_tid'], "🎉 Сделка принята!\nКонтакт продавца: <b>$ownerContact</b> ({$owner['first_name']})");
-        sendMessage($chatId, "🎉 Контакты покупателя: <b>$respContact</b> ({$mInfo['responder_name']})");
+        sendMessage($mInfo['responder_tid'], "🎉 <b>Сделка принята!</b>\n\nКонтакт продавца: <b>$ownerContact</b> ({$owner['first_name']})\n\nДоговоритесь об обмене. После того как обмен будет <b>физически совершен</b>, создатель заявки сможет закрыть её или изменить остатки.");
+        
+        sendMessage($chatId, "🎉 <b>Контакты покупателя:</b>\n<b>$respContact</b> ({$mInfo['responder_name']})\n\nСвяжитесь для совершения обмена.\n\nКогда вы <b>завершите</b> обмен, выберите действие для вашей заявки ниже:");
 
         // После сделки - управление остатком
-        sendMessage($chatId, "Сделка завершена. Что сделать с остатком в заявке #{$mInfo['order_id']}?", [
+        sendMessage($chatId, "Что сделать с заявкой #{$mInfo['order_id']} после обмена?", [
             'inline_keyboard' => [
-                [['text' => '✏️ Изменить объем', 'callback_data' => "edit_amt_{$mInfo['order_id']}"]],
-                [['text' => '❌ Закрыть заявку', 'callback_data' => "close_{$mInfo['order_id']}"]],
-                [['text' => '⚠️ Оставить как есть (неудачно)', 'callback_data' => 'main_menu']]
+                [['text' => '✅ Обмен совершен (Закрыть)', 'callback_data' => "close_{$mInfo['order_id']}"]],
+                [['text' => '✏️ Частичный обмен (Изменить объем)', 'callback_data' => "edit_amt_{$mInfo['order_id']}"]],
+                [['text' => '⚠️ Оставить как есть (Неудачно)', 'callback_data' => 'main_menu']]
             ]
         ]);
         exit;

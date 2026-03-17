@@ -14,6 +14,7 @@ CREATE TABLE IF NOT EXISTS `orders` (
     `user_id` INT NOT NULL,
     `sell_currency` VARCHAR(10) NOT NULL,
     `amount` DECIMAL(15,2) NOT NULL,
+    `usd_amount` DECIMAL(15,2) DEFAULT 0.00,
     `buy_currencies` JSON NOT NULL,
     `status` ENUM('open', 'closed', 'partially_filled') DEFAULT 'open',
     `is_active` BOOLEAN DEFAULT TRUE,
