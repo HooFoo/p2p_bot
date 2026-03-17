@@ -162,7 +162,11 @@ if ($callbackQuery) {
         $pdo->prepare("UPDATE users SET step_data = ? WHERE id = ?")->execute([json_encode($stepData), $user['id']]);
         
         $buttons = [];
-        foreach (array_chunk($config['currencies'], 2) as $chunk) {
+        $availableBuy = array_filter($config['currencies'], function($c) use ($stepData) {
+            return $c !== $stepData['sell_currency'];
+        });
+        
+        foreach (array_chunk($availableBuy, 2) as $chunk) {
             $row = [];
             foreach ($chunk as $curr) {
                 $check = in_array($curr, $stepData['buy_currencies']) ? " ✅" : "";
@@ -198,7 +202,9 @@ if ($callbackQuery) {
         } else {
             $matchButtons = [];
             foreach ($matches as $m) {
-                $matchButtons[] = [['text' => "👤 {$m['first_name']} ({$m['sell_currency']} -> {$m['amount']})", 'callback_data' => "respond_{$m['id']}"]];
+                $buyArr = json_decode($m['buy_currencies'], true);
+                $buyStr = implode(', ', $buyArr);
+                $matchButtons[] = [['text' => "👤 {$m['first_name']} ({$m['amount']} {$m['sell_currency']} -> $buyStr)", 'callback_data' => "respond_{$m['id']}"]];
             }
             $matchButtons[] = [['text' => '◀️ В главное меню', 'callback_data' => 'main_menu']];
             sendMessage($chatId, "Найдены подходящие заявки (до 10):", ['inline_keyboard' => $matchButtons]);
@@ -270,7 +276,9 @@ if ($callbackQuery) {
             $txt = "Ваши активные заявки:\n";
             $btns = [];
             foreach ($orders as $o) {
-                $txt .= "• #{$o['id']} {$o['sell_currency']} -> {$o['amount']}\n";
+                $buyArr = json_decode($o['buy_currencies'], true);
+                $buyStr = implode(', ', $buyArr);
+                $txt .= "• #{$o['id']} <b>{$o['amount']} {$o['sell_currency']}</b> -> $buyStr\n";
                 $btns[] = [['text' => "Закрыть #{$o['id']}", 'callback_data' => "close_{$o['id']}"]];
             }
             $btns[] = [['text' => '◀️ Назад', 'callback_data' => 'main_menu']];
@@ -292,8 +300,10 @@ if ($callbackQuery) {
         } else {
             $txt = "<b>Ваша история (последние 20):</b>\n\n";
             foreach ($history as $h) {
+                $buyArr = json_decode($h['buy_currencies'], true);
+                $buyStr = implode(', ', $buyArr);
                 $status = ($h['status'] === 'closed') ? "✅" : "⚠️";
-                $txt .= "$status #{$h['id']} {$h['sell_currency']} -> {$h['amount']} (" . date('d.m H:i', strtotime($h['updated_at'])) . ")\n";
+                $txt .= "$status #{$h['id']} <b>{$h['amount']} {$h['sell_currency']}</b> -> $buyStr (" . date('d.m H:i', strtotime($h['updated_at'])) . ")\n";
             }
             sendMessage($chatId, $txt, $mainMenu);
         }
@@ -344,7 +354,11 @@ if ($text && $state === 'WAIT_AMOUNT') {
     $pdo->prepare("UPDATE users SET state = 'WAIT_BUY_CURRENCY', step_data = ? WHERE id = ?")->execute([json_encode($stepData), $user['id']]);
     
     $buttons = [];
-    foreach (array_chunk($config['currencies'], 2) as $chunk) {
+    $availableBuy = array_filter($config['currencies'], function($c) use ($stepData) {
+        return $c !== $stepData['sell_currency'];
+    });
+    
+    foreach (array_chunk($availableBuy, 2) as $chunk) {
         $row = [];
         foreach ($chunk as $curr) { $row[] = ['text' => $curr, 'callback_data' => "buy_$curr"]; }
         $buttons[] = $row;

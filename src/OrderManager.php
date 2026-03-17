@@ -87,7 +87,7 @@ class OrderManager {
         $order = $stmt->fetch();
         $usdAmount = CurrencyRates::toUsd($newAmount, $order['sell_currency']);
 
-        $stmt = $this->pdo->prepare("UPDATE orders SET amount = ?, usd_amount = ?, status = 'partially_filled' WHERE id = ? AND user_id = ?");
+        $stmt = $this->pdo->prepare("UPDATE orders SET amount = ?, usd_amount = ?, status = 'partially_filled', is_active = TRUE WHERE id = ? AND user_id = ?");
         return $stmt->execute([$newAmount, $usdAmount, $orderId, $userId]);
     }
 
