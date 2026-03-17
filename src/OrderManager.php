@@ -13,7 +13,12 @@ class OrderManager {
      * Поиск подходящих заявок для пользователя
      */
     public function findMatches($userId, $sellCurrency, $buyCurrencies) {
-        $buyCurrenciesList = json_decode($buyCurrencies, true);
+        $buyCurrenciesList = is_array($buyCurrencies) ? $buyCurrencies : json_decode($buyCurrencies, true);
+        
+        if (empty($buyCurrenciesList)) {
+            return [];
+        }
+
         $placeholders = implode(',', array_fill(0, count($buyCurrenciesList), '?'));
         
         // Магия P2P: ищем тех, кто продает то, что мы хотим купить, 

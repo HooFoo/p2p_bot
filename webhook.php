@@ -150,18 +150,20 @@ if ($callbackQuery) {
         $orderManager->createOrder($user['id'], $stepData['sell_currency'], $stepData['amount'], $stepData['buy_currencies']);
         $pdo->prepare("UPDATE users SET state = 'IDLE', step_data = NULL WHERE id = ?")->execute([$user['id']]);
         
-        sendMessage($chatId, "✅ <b>Заявка создана!</b>\n\nИщем подходящие предложения...");
+        // Убираем кнопки из сообщения с выбором валют
+        editMessageText($chatId, $callbackQuery['message']['message_id'], "✅ <b>Заявка создана!</b>\n\nИщем подходящие предложения...");
         
         // Мачинг
-        $matches = $orderManager->findMatches($user['id'], $stepData['sell_currency'], json_encode($stepData['buy_currencies']));
+        $matches = $orderManager->findMatches($user['id'], $stepData['sell_currency'], $stepData['buy_currencies']);
         
         if (empty($matches)) {
-            sendMessage($chatId, "Пока подходящих заявок нет. Вам придет уведомление, когда кто-то откликнется.", $mainMenu);
+            sendMessage($chatId, "Пока подходящих заявок нет. Вам придет уведомление, когда кто-то откликнется на вашу заявку.", $mainMenu);
         } else {
             $matchButtons = [];
             foreach ($matches as $m) {
                 $matchButtons[] = [['text' => "👤 {$m['first_name']} ({$m['sell_currency']} -> {$m['amount']})", 'callback_data' => "respond_{$m['id']}"]];
             }
+            $matchButtons[] = [['text' => '◀️ В главное меню', 'callback_data' => 'main_menu']];
             sendMessage($chatId, "Найдены подходящие заявки (до 10):", ['inline_keyboard' => $matchButtons]);
         }
         exit;
@@ -243,9 +245,56 @@ if ($callbackQuery) {
         sendMessage($chatId, "Главное меню:", $mainMenu);
         exit;
     }
+
+    // История
+    if ($data === 'history') {
+        $history = $orderManager->getHistory($user['id']);
+        if (empty($history)) {
+            sendMessage($chatId, "Ваша история пока пуста. Закройте хотя бы одну заявку, чтобы она появилась здесь.", $mainMenu);
+        } else {
+            $txt = "<b>Ваша история (последние 20):</b>\n\n";
+            foreach ($history as $h) {
+                $status = ($h['status'] === 'closed') ? "✅" : "⚠️";
+                $txt .= "$status #{$h['id']} {$h['sell_currency']} -> {$h['amount']} (" . date('d.m H:i', strtotime($h['updated_at'])) . ")\n";
+            }
+            sendMessage($chatId, $txt, $mainMenu);
+        }
+        exit;
+    }
+
+    // Закрытие заявки
+    if (strpos($data, 'close_') === 0) {
+        $orderId = (int)str_replace('close_', '', $data);
+        $orderManager->closeOrder($orderId, $user['id']);
+        sendMessage($chatId, "✅ Заявка #$orderId закрыта.", $mainMenu);
+        exit;
+    }
+
+    // Редактирование объема (начало)
+    if (strpos($data, 'edit_amt_') === 0) {
+        $orderId = (int)str_replace('edit_amt_', '', $data);
+        $stepData = ['edit_order_id' => $orderId];
+        $pdo->prepare("UPDATE users SET state = 'WAIT_NEW_AMOUNT', step_data = ? WHERE id = ?")->execute([json_encode($stepData), $user['id']]);
+        sendMessage($chatId, "Введите <b>новый оставшийся объем</b> для заявки #$orderId (число):");
+        exit;
+    }
 }
 
 // --- ОБРАБОТКА ТЕКСТА (FSM) ---
+if ($text && $state === 'WAIT_NEW_AMOUNT') {
+    $amount = str_replace(',', '.', $text);
+    if (!is_numeric($amount) || $amount < 0) {
+        sendMessage($chatId, "Пожалуйста, введите корректное число (0 или больше):");
+        exit;
+    }
+    
+    $orderId = $stepData['edit_order_id'];
+    $orderManager->updateAmount($orderId, $user['id'], (float)$amount);
+    
+    $pdo->prepare("UPDATE users SET state = 'IDLE', step_data = NULL WHERE id = ?")->execute([$user['id']]);
+    sendMessage($chatId, "✅ Объем заявки #$orderId изменен на $amount.", $mainMenu);
+    exit;
+}
 if ($text && $state === 'WAIT_AMOUNT') {
     $amount = str_replace(',', '.', $text);
     if (!is_numeric($amount) || $amount <= 0) {

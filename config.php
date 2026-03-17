@@ -12,3 +12,5 @@ return [
     'currencies' => ['GEL', 'USD', 'RUB', 'USDT'],
     'items_per_page' => 10
 ];
+
+?>
