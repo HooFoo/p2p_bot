@@ -112,7 +112,7 @@ if ($callbackQuery) {
     }
 
     // Выбор валюты ПОЛУЧИТЬ (множественный выбор)
-    if (strpos($data, 'buy_') === 0 && $state === 'WAIT_BUY_CURRENCY') {
+    if (strpos($data, 'buy_') === 0 && $data !== 'buy_done' && $state === 'WAIT_BUY_CURRENCY') {
         $currency = str_replace('buy_', '', $data);
         if (!isset($stepData['buy_currencies'])) $stepData['buy_currencies'] = [];
         
